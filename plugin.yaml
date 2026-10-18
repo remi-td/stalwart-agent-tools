@@ -1,0 +1,19 @@
+name: stalwart-agent-tools
+version: 0.1.0
+description: Profile-scoped structured Stalwart mail/calendar adapter; only enabled for explicitly configured administrative profiles.
+author: Local
+kind: backend
+requires_hermes: ">=2026.9"
+provides_tools:
+  - stalwart_mail_list
+  - stalwart_mail_search
+  - stalwart_mail_draft
+  - stalwart_mail_send
+  - stalwart_mail_send_calendar_invitation
+  - stalwart_calendar_list
+  - stalwart_calendar_upsert
+  - stalwart_calendar_delete
+  - stalwart_calendar_subscribe_external
+config_schema:
+  enabled_profiles: {type: list, required: true}
+  profile_bindings: {type: dict, required: true}
