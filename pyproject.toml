@@ -1,11 +1,16 @@
 [build-system]
 requires = ["hatchling>=1.27.0,<2"]
 build-backend = "hatchling.build"
+
 [project]
 name = "stalwart-agent-tools"
-version = "0.1.0"
+version = "0.2.0"
 description = "Profile-scoped JMAP, CalDAV, SMTP and ICS bridge adapter for Hermes"
 requires-python = ">=3.11"
 dependencies = []
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/stalwart_agent_tools"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/stalwart_agent_tools", "plugin.yaml", "README.md"]

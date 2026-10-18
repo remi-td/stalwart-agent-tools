@@ -1,9 +1,9 @@
 name: stalwart-agent-tools
-version: 0.1.0
-description: Profile-scoped structured Stalwart mail/calendar adapter; only enabled for explicitly configured administrative profiles.
+version: 0.2.0
+description: Profile-scoped JMAP, verified local SMTP submission, CalDAV, and constrained ICS bridge for explicitly bound non-family profiles.
 author: Local
 kind: backend
-requires_hermes: ">=2026.9"
+requires_hermes: ">=0.21.5"
 provides_tools:
   - stalwart_mail_list
   - stalwart_mail_search
@@ -15,5 +15,4 @@ provides_tools:
   - stalwart_calendar_delete
   - stalwart_calendar_subscribe_external
 config_schema:
-  enabled_profiles: {type: list, required: true}
-  profile_bindings: {type: dict, required: true}
+  binding: {type: dict, required: true}

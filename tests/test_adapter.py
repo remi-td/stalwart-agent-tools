@@ -1,33 +1,74 @@
-import sys, unittest
+import importlib.util, json, os, sys, tempfile, unittest
+from pathlib import Path
 sys.path.insert(0, "src")
-from stalwart_agent_tools.adapter import *
-class Fake:
- def __init__(self): self.sent={}; self.events={}; self.calls=0
- def jmap_list(self,*x): return []
- def jmap_search(self,*x): return []
- def jmap_draft(self,*x): return {"draft":"d"}
- def smtp_submit(self,a,r,s,t,k,**kw): assert kw["tls_verify"] is True; self.sent[k]={"id":k}; return {"message_id":k}
- def smtp_submit_calendar(self,a,r,s,ics,k,**kw): assert "METHOD:REQUEST" in ics and "\\," in ics and "\r\n" in ics; return self.smtp_submit(a,r,s,ics,k,**kw)
- def jmap_get_sent(self,a,i): return self.sent.get(i)
- def caldav_list(self,*x): return list(self.events.values())
- def caldav_upsert(self,a,c,e,k): self.calls+=1; self.events[e["uid"]]=dict(e); return dict(e)
- def caldav_get(self,a,c,u): return self.events.get(u)
- def caldav_delete(self,a,c,u,k): self.events.pop(u,None)
- def store_secret(self,p,k,v): assert v.startswith("https://"); return "opaque"
-def adapter():
- return StalwartAdapter(ProfilePolicy("synthetic","opaque-account",frozenset({"ok@example.test"}),{"planning":{"calendar_id":"p","write":True},"reference":{"calendar_id":"r","write":False}},frozenset({"safe.example"})),Fake(),resolve=lambda h:["93.184.216.34"])
-class TestAdapter(unittest.TestCase):
- def test_send_requires_sent_readback(self): self.assertEqual(adapter().send("ok@example.test","s","b","k")["sent_id"],"k")
- def test_allowlist_before_backend(self):
-  a=adapter(); self.assertRaises(PolicyError,a.send,"bad@example.test","s","b","k"); self.assertFalse(a.backend.sent)
- def test_reference_write_denied_before_backend(self):
-  a=adapter(); self.assertRaises(PolicyError,a.upsert_calendar,"reference",{"uid":"u"},"k"); self.assertEqual(a.backend.calls,0)
- def test_calendar_crud_readback(self):
-  a=adapter(); self.assertEqual(a.upsert_calendar("planning",{"uid":"u","summary":"x"},"k")["uid"],"u"); self.assertTrue(a.delete_calendar("planning","u","d")["deleted"])
- def test_invitation_is_respondable(self): self.assertEqual(adapter().send_invitation("ok@example.test",{"uid":"u","summary":"a,b","start":"20260101T010000Z","end":"20260101T020000Z"},"i")["sent_id"],"i")
- def test_bridge_ssrf_and_secret_url_suppression(self):
-  a=adapter(); self.assertNotIn("https",str(a.register_bridge("https://safe.example/feed"))); self.assertRaises(PolicyError,a.register_bridge,"http://safe.example/feed"); a.resolve=lambda h:["127.0.0.1"]; self.assertRaises(PolicyError,a.register_bridge,"https://safe.example/feed")
- def test_redirect_is_revalidated(self): self.assertRaises(PolicyError,adapter().fetch_bridge,"https://safe.example/f",lambda u,**k:{"redirect":"https://evil.example/f"})
- def test_mail_bounds(self):
-  a=adapter(); self.assertRaises(PolicyError,a.list_mail,"All Mail"); self.assertRaises(PolicyError,a.search_mail,"x"*257)
-if __name__ == "__main__": unittest.main()
+from stalwart_agent_tools.core import (CalendarBinding, IdempotencyStore, PolicyError,
+ ProfilePolicy, StalwartAdapter, AmbiguousSubmission, invitation_ics, validate_bridge_url)
+
+class FakeTransport:
+ def __init__(self): self.calls=[]; self.events={}; self.sent=[]
+ def jmap_query(self,*x): self.calls.append(("query",x)); return {"list":[]}
+ def jmap_draft(self,*x): self.calls.append(("draft",x)); return {"created":{"draft":{"id":"d1"}}}
+ def smtp_submit(self,r,s,t,mid,ical=None): self.calls.append(("smtp",r,mid)); self.sent.append({"message_id":mid,"recipient":r})
+ def find_sent(self,mid,r): return {"list":[x for x in self.sent if x["message_id"]==mid and x["recipient"]==r]}
+ def caldav_get(self,b,u): return self.events.get(u)
+ def caldav_put(self,b,u,ical,etag=None): self.events[u]={"uid":u,"etag":"E1","icalendar":ical}; return "E1"
+ def caldav_delete(self,b,u,etag): self.events.pop(u,None)
+
+def policy(): return ProfilePolicy("ops","acc","agent","agent@example.test",frozenset({"ok@example.test"}),frozenset({"Inbox","Junk Mail","Sent"}),{"planning":CalendarBinding("p","plan",True,True),"reference":CalendarBinding("r","ref",True,False)},frozenset({"safe.example"}),"https://mail.example.test/jmap/","https://mail.example.test","smtp.example.test",465,"JMAP_TOKEN")
+def adapter(fake=None):
+ d=tempfile.TemporaryDirectory(); a=StalwartAdapter(policy(),fake or FakeTransport(),IdempotencyStore(Path(d.name)/"state.sqlite"),resolver=lambda h:["93.184.216.34"]);a._tmp=d;return a
+
+class AdapterTests(unittest.TestCase):
+ def test_recipient_denied_before_smtp(self):
+  f=FakeTransport();a=adapter(f)
+  with self.assertRaises(PolicyError):a.send("bad@example.test","subject","body","abcdefgh")
+  self.assertFalse(f.calls)
+ def test_send_readback_and_atomic_replay(self):
+  f=FakeTransport();a=adapter(f);one=a.send("ok@example.test","subject","body","abcdefgh");two=a.send("ok@example.test","subject","body","abcdefgh")
+  self.assertTrue(one["sent_copy_verified"]);self.assertEqual(one,two);self.assertEqual(len([x for x in f.calls if x[0]=="smtp"]),1)
+ def test_no_duplicate_after_readback_ambiguity(self):
+  class Missing(FakeTransport):
+   def find_sent(self,*x):return {"list":[]}
+  f=Missing();a=adapter(f)
+  with self.assertRaises(AmbiguousSubmission):a.send("ok@example.test","subject","body","abcdefgh")
+  with self.assertRaises(AmbiguousSubmission):a.send("ok@example.test","subject","body","abcdefgh")
+  self.assertEqual(len([x for x in f.calls if x[0]=="smtp"]),1)
+ def test_draft_and_calendar_ownership(self):
+  f=FakeTransport();a=adapter(f);self.assertTrue(a.draft("ok@example.test","s","b","abcdefgh")["read_back"])
+  with self.assertRaises(PolicyError):a.calendar_upsert("reference",{"uid":"u","summary":"x","start":"20260101T010000Z","end":"20260101T020000Z"},"abcdefgh")
+  self.assertFalse(f.events)
+ def test_calendar_readback_and_delete(self):
+  a=adapter();event={"uid":"u","summary":"x","start":"20260101T010000Z","end":"20260101T020000Z"};self.assertTrue(a.calendar_upsert("planning",event,"abcdefgh")["read_back"]);self.assertTrue(a.calendar_delete("planning","u","ijklmnop")["deleted"])
+ def test_ics_unicode_folding_and_cancel(self):
+  ics=invitation_ics({"uid":"u","summary":"é"*100,"start":"20260101T010000Z","end":"20260101T020000Z","method":"CANCEL","sequence":1},"ok@example.test","agent@example.test")
+  self.assertIn("METHOD:CANCEL",ics);self.assertIn("STATUS:CANCELLED",ics);self.assertIn("é"*100,ics.replace("\r\n ",""));self.assertTrue(all(len(x.encode())<=75 for x in ics.split("\r\n") if x))
+ def test_ssrf_rejects_private_cgnat_and_redirect_host(self):
+  for ip in ("127.0.0.1","100.64.0.1","224.0.0.1"):
+   with self.assertRaises(PolicyError):validate_bridge_url("https://safe.example/x",frozenset({"safe.example"}),lambda h:[ip])
+  with self.assertRaises(PolicyError):validate_bridge_url("https://evil.example/x",frozenset({"safe.example"}),lambda h:["93.184.216.34"])
+
+class State:
+ def __init__(self,p):self.data_dir=p;self.saved={}
+ def set(self,k,v):self.saved[k]=v
+class Context:
+ def __init__(self,name,binding,p):self.profile_name=name;self.binding=binding;self.state=State(p);self.tools={}
+ def get_config(self,key,default=None):return self.binding if key=="binding" else default
+ def register_tool(self,**kw):self.tools[kw["name"]]=kw
+
+def binding(profile="ops"):
+ return {"enabled":True,"profile":profile,"mail":{"account_id":"a","account_name":"agent","organizer":"agent@example.test","allowed_recipients":["ok@example.test"],"folders":["Inbox","Sent"]},"calendars":{"planning":{"calendar_id":"p","slug":"plan","read":True,"write":True}},"bridge_hosts":["safe.example"],"transport":{"jmap_url":"https://mail.example.test/jmap/","caldav_base_url":"https://mail.example.test","smtp_host":"smtp.example.test","smtp_port":465,"credential_env":"JMAP_TOKEN"}}
+def load_plugin():
+ spec=importlib.util.spec_from_file_location("plugin",Path("__init__.py"));m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m);return m
+class PluginTests(unittest.TestCase):
+ def test_json_handlers_and_profile_dispatch(self):
+  os.environ["JMAP_TOKEN"]="synthetic";m=load_plugin()
+  with tempfile.TemporaryDirectory() as d:
+   good=Context("ops",binding(),Path(d));bad=Context("other",binding(),Path(d));m.register(good);m.register(bad)
+   self.assertTrue(good.tools["stalwart_mail_list"]["check_fn"]());self.assertFalse(bad.tools["stalwart_mail_list"]["check_fn"]())
+   response=json.loads(bad.tools["stalwart_mail_list"]["handler"]({}))
+   self.assertFalse(response["ok"]);self.assertNotIn("mail.example",json.dumps(response))
+ def test_missing_credential_hides_tools(self):
+  os.environ.pop("JMAP_TOKEN",None);m=load_plugin()
+  with tempfile.TemporaryDirectory() as d:
+   c=Context("ops",binding(),Path(d));m.register(c);self.assertFalse(c.tools["stalwart_mail_list"]["check_fn"]())
+if __name__=="__main__":unittest.main()

@@ -1,7 +1,8 @@
 version = 1
-revision = 1
+revision = 3
 requires-python = ">=3.11"
+
 [[package]]
 name = "stalwart-agent-tools"
-version = "0.1.0"
-source = { virtual = "." }
+version = "0.2.0"
+source = { editable = "." }
