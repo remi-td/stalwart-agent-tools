@@ -14,10 +14,12 @@ import sqlite3
 import ssl
 import threading
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from ipaddress import ip_address
 from pathlib import Path
 from typing import Any, Callable, Protocol
 from urllib.parse import urljoin, urlparse
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 try:  # Keep the public errors consistent when used beside the native adapter.
     from .core import ConflictError, PolicyError, TransportError
@@ -240,6 +242,96 @@ def parse_calendar(payload: bytes) -> dict[str, str]:
         _error("invalid calendar")
     return events
 
+def expand_calendar(payload: bytes, range_start: datetime, range_end: datetime, limit: int = 200) -> dict[str, str]:
+    """Expand the deliberately supported feed subset into bounded UTC VEVENTs.
+
+    This is intentionally not a general RFC 5545 implementation.  It accepts
+    UTC or IANA ``TZID`` timestamps declared by a VTIMEZONE, weekly RRULEs and
+    single overrides; unsupported recurrence grammar fails closed.
+    """
+    if range_start.tzinfo is None or range_end.tzinfo is None or range_end<=range_start or range_end-range_start>timedelta(days=31) or not 1<=limit<=200:
+        _error("invalid calendar range")
+    try: text=payload.decode("utf-8")
+    except UnicodeDecodeError: raise PolicyError("invalid calendar")
+    lines=_unfold(text)
+    if not lines or lines[0].upper()!="BEGIN:VCALENDAR" or lines[-1].upper()!="END:VCALENDAR": _error("invalid calendar")
+    zones=set()
+    for index,line in enumerate(lines):
+        if line.upper()=="BEGIN:VTIMEZONE":
+            try: zones.add(next(_property(value)[1] for value in lines[index+1:] if _property(value)[0]=="TZID"))
+            except StopIteration: _error("invalid calendar")
+    blocks=[]; current=None
+    for line in lines:
+        if line.upper()=="BEGIN:VEVENT":
+            if current is not None: _error("invalid calendar")
+            current=[]
+        elif line.upper()=="END:VEVENT":
+            if current is None: _error("invalid calendar")
+            blocks.append(current); current=None
+        elif current is not None: current.append(line)
+    if current is not None: _error("invalid calendar")
+    def props(block):
+        result={}
+        for line in block:
+            if ":" not in line: _error("invalid calendar")
+            left,value=line.split(":",1); bits=left.split(";"); name=bits[0].upper(); params={}
+            for item in bits[1:]:
+                if "=" not in item: _error("invalid calendar")
+                key,val=item.split("=",1); params[key.upper()]=val
+            if name in result: _error("invalid calendar")
+            result[name]=(value,params)
+        return result
+    def instant(item):
+        value,params=item
+        try:
+            if value.endswith("Z"): return datetime.strptime(value,"%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
+            tzid=params.get("TZID")
+            if not tzid or tzid not in zones: _error("unsupported calendar timezone")
+            return datetime.strptime(value,"%Y%m%dT%H%M%S").replace(tzinfo=ZoneInfo(tzid)).astimezone(timezone.utc)
+        except (ValueError, ZoneInfoNotFoundError): _error("unsupported calendar timezone")
+    masters={}; overrides={}
+    for block in blocks:
+        p=props(block); uid=p.get("UID",("",{}))[0]
+        if not _UID.fullmatch(uid) or "DTSTART" not in p or "DTEND" not in p: _error("invalid calendar")
+        if "RECURRENCE-ID" in p:
+            key=(uid,instant(p["RECURRENCE-ID"]))
+            if key in overrides: _error("invalid calendar")
+            overrides[key]=p
+        elif uid in masters: _error("invalid calendar")
+        else: masters[uid]=p
+    if any(uid not in masters for uid,_ in overrides): _error("invalid calendar")
+    output={}
+    for uid,p in masters.items():
+        start,end=instant(p["DTSTART"]),instant(p["DTEND"])
+        assert start is not None and end is not None
+        if end<=start: _error("invalid calendar")
+        rrule=p.get("RRULE",(None,{}))[0]; candidates=[start]
+        if rrule:
+            bits=dict(item.split("=",1) for item in rrule.split(";") if "=" in item)
+            if set(bits)-{"FREQ","INTERVAL","COUNT","UNTIL"} or bits.get("FREQ")!="WEEKLY": _error("unsupported recurrence")
+            interval=int(bits.get("INTERVAL","1")); count=int(bits.get("COUNT","200"))
+            if interval<1 or count<1 or count>200: _error("unsupported recurrence")
+            until=instant((bits["UNTIL"],{})) if "UNTIL" in bits else range_end
+            assert until is not None
+            value,params=p["DTSTART"]
+            if value.endswith("Z"):
+                sequence=[start+timedelta(days=7*interval*n) for n in range(count)]
+            else:
+                local=datetime.strptime(value,"%Y%m%dT%H%M%S").replace(tzinfo=ZoneInfo(params["TZID"]))
+                sequence=[(local+timedelta(days=7*interval*n)).astimezone(timezone.utc) for n in range(count)]
+            candidates=[candidate for candidate in sequence if candidate<=until and candidate<range_end]
+        duration=end-start
+        for occurrence in candidates:
+            event=overrides.get((uid,occurrence),p)
+            actual_start,actual_end=instant(event["DTSTART"]),instant(event["DTEND"])
+            assert actual_start is not None and actual_end is not None
+            if event.get("STATUS",("",{}))[0]=="CANCELLED" or actual_end<=range_start or actual_start>=range_end: continue
+            key=hashlib.sha256((uid+"\0"+occurrence.isoformat()).encode()).hexdigest()
+            summary=event.get("SUMMARY",("",{}))[0]
+            output[key]="\r\n".join(["BEGIN:VCALENDAR","VERSION:2.0","BEGIN:VEVENT",f"UID:{key}",f"DTSTAMP:{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}",f"DTSTART:{actual_start:%Y%m%dT%H%M%SZ}",f"DTEND:{actual_end:%Y%m%dT%H%M%SZ}",f"SUMMARY:{summary}","END:VEVENT","END:VCALENDAR",""])
+            if len(output)>limit: _error("calendar occurrence limit", TransportError)
+    return output
+
 
 class OwnershipManifest:
     """Durable manifest containing no source URL or calendar payload."""
@@ -275,7 +367,7 @@ def _digest(ical: str) -> str:
     return hashlib.sha256(ical.encode("utf-8")).hexdigest()
 
 
-def refresh(source_url: str, allowed_hosts: frozenset[str] | set[str], target: CalendarTarget, state: str | Path | Any, *, resolver: Callable[[str], list[str]] = lambda host: [x[4][0] for x in socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)], http: Any | None = None, max_bytes: int = _MAX_BYTES) -> dict[str, int | bool]:
+def refresh(source_url: str, allowed_hosts: frozenset[str] | set[str], target: CalendarTarget, state: str | Path | Any, *, resolver: Callable[[str], list[str]] = lambda host: [x[4][0] for x in socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)], http: Any | None = None, max_bytes: int = _MAX_BYTES, range_start: datetime | None = None, range_end: datetime | None = None) -> dict[str, int | bool]:
     """Fetch an allowlisted ICS feed and mirror only bridge-owned VEVENTs.
 
     ``target`` must implement conditional ``put``/``delete`` using the supplied
@@ -291,7 +383,13 @@ def refresh(source_url: str, allowed_hosts: frozenset[str] | set[str], target: C
         return {"not_modified": True, "created": 0, "updated": 0, "deleted": 0, "skipped": 0}
     if response.status != 200 or not response.headers.get("content-type", "").lower().split(";", 1)[0].strip() == "text/calendar":
         _error("invalid calendar response", TransportError)
-    incoming = parse_calendar(response.body)
+    advanced=any(token in response.body.upper() for token in (b"VTIMEZONE",b"RRULE",b"RECURRENCE-ID"))
+    if advanced:
+        range_start=range_start or datetime.now(timezone.utc)
+        range_end=range_end or range_start+timedelta(days=31)
+        incoming=expand_calendar(response.body,range_start,range_end)
+    else:
+        incoming = parse_calendar(response.body)
     owned = manifest.owned(source_id)
     created = updated = deleted = skipped = 0
     for uid, ical in incoming.items():

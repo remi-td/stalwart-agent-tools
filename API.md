@@ -1,29 +1,31 @@
-# Adapter contract v0.2.0
+# Adapter contract v0.3.0
 
-`stalwart_agent_tools` is the Python library used by a policy-composition plugin. The separate Hermes directory plugin at repository root registers `stalwart_*` tools **only for explicitly bound administrative profiles**; do not register it in Sharik. Personal Workbench should import the package and expose only its own `personal_*` schemas.
+`stalwart_agent_tools` is a policy-bound library. Native registration is for explicitly bound non-family profiles only; do not install it in Sharik. A conversational integration exposes only `personal_calendar_query` for calendar reads.
 
-```python
-from pathlib import Path
-from stalwart_agent_tools import (
-    resolve_policy, StalwartTransport, IdempotencyStore, StalwartAdapter,
-)
+## `personal_calendar_query`
 
-# `binding` comes from the active profile's validated plugin settings;
-# neither credentials nor URLs come from model tool arguments.
-policy = resolve_policy(active_profile_name, binding)
-adapter = StalwartAdapter(
-    policy, StalwartTransport(policy),
-    IdempotencyStore(profile_plugin_data_dir / "idempotency.sqlite"),
-)
-messages = adapter.list_mail("Inbox", 20)
-# adapter.send(recipient, subject, text, stable_idempotency_key)
-# adapter.calendar_upsert("planning", utc_event_fields, stable_idempotency_key)
+```json
+{
+  "resource": "reference | planning | combined",
+  "start": "2026-10-20T00:00:00Z",
+  "end": "2026-10-21T00:00:00Z",
+  "fields": ["summary", "start", "end"],
+  "limit": 20
+}
 ```
 
-Public methods: `list_mail`, `search_mail`, `draft`, `send`, `send_invitation`, `calendar_list`, `calendar_upsert`, `calendar_delete`, `register_bridge`, `refresh_bridge`. Mail `send` and invitation return local-submission status and exact Sent-copy evidence or an opaque failure; remote delivery is never inferred. Planning writes require a writable logical calendar; the bridge accepts only a configured reference-only mirror. `refresh_bridge` requires the URL resolved from the profile secret reference (never model input) and a profile-local state directory.
+`start` and `end` are required RFC 3339 timestamps with offsets. The interval is half-open `[start, end)`, must be positive, and is at most 31 days. `fields` defaults to `summary`, `start`, `end`; the only supported fields are `summary`, `start`, `end`, and `status`. The limit defaults to 20 and is at most 50. Results are UTC structured records and the complete serialized response is capped at 8 KiB. Raw ICS, UIDs, locations, descriptions, attendees, account IDs, URLs, ETags, and source data never appear.
 
-Requests currently use a single recipient, UTC iCalendar time strings (`YYYYMMDDTHHMMSSZ`), a stable UID composed of letters/digits/dot/underscore/hyphen, and a unique idempotency key of 8–128 characters. Reusing a key with different content is rejected. The library deliberately does not expose arbitrary JMAP/CalDAV methods or a raw HTTP fetcher to model tools.
+`reference` queries the read-only mirror. `planning` queries the writable planning calendar. `combined` executes the same bounded query on both and adds only a logical `resource` label. Writes are separate planning-only operations; reference writes fail closed.
 
-The native plugin resolves `ctx.profile_name`, `ctx.get_config('binding')`, and `ctx.state.data_dir` at tool execution time. It returns JSON strings with `ok`/`result` or opaque `error.code`; no exception message, transport endpoint or source URL is returned. The plugin registration and schema are validated by `hermes plugins doctor . --ci` and `hermes plugins validate .`.
+The transport sends a matching CalDAV `time-range` filter and also discards any returned event outside the requested range. Invalid, malformed, unsupported, oversized, or transport-failed reads return the plugin's opaque error envelope. They never authorize file/cache reads, shell commands, bridge-state inspection, source retrieval, or delegated workers as fallbacks.
 
-**Compatibility boundary:** existing owner-scoped helper scripts remain untouched and operational. They are not invoked through model-visible terminal commands. This adapter's new transport still needs disposable-account Stalwart interoperability and feed-grammar validation before it can replace helpers in production. See `DEPLOYMENT.md` and `SECURITY.md`.
+## External ICS compatibility
+
+The bridge accepts a deliberately restricted grammar: UTC or IANA `TZID` timestamps declared by `VTIMEZONE`, weekly recurrence (`FREQ=WEEKLY`, `INTERVAL`, `COUNT`, `UNTIL`), and one-off recurrence overrides. It bounds expansion to a caller-supplied 31-day range and emits only hashed occurrence IDs internally. Unsupported recurrence or timezone semantics fail closed with an opaque error; raw source content and URLs are absent from state and tool output.
+
+## Mail transport and trust
+
+Endpoints, account IDs, calendar slugs, secrets, and CA paths are profile configuration, never tool parameters. TLS always uses `CERT_REQUIRED` plus hostname validation. `transport.tls_ca_bundle_file` may point to an absolute readable private-CA PEM bundle; the endpoint must use the hostname in its certificate SAN. There is no insecure-loopback or verification-disable option.
+
+JMAP special folders resolve by the standard `drafts` and `sent` roles, not display names. Operators may instead bind opaque JMAP IDs with `mail.special_mailbox_ids`; localized names are never used as a fallback. Sent role resolution happens before SMTP submission, preventing a known bad mailbox binding from stranding a submitted message behind a pending idempotency key.

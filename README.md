@@ -20,7 +20,9 @@ plugins:
             account_name: service-account-name
             organizer: agent@example.invalid
             allowed_recipients: [approved@example.invalid]
-            folders: [Inbox, Junk Mail, Sent]
+            folders: [Inbox, Junk Mail]
+            # Optional opaque JMAP IDs only when standard roles are unavailable.
+            # special_mailbox_ids: {drafts: opaque-id, sent: opaque-id}
           calendars:
             planning:
               calendar_id: opaque-calendar-id
@@ -43,6 +45,8 @@ plugins:
             smtp_port: 465
             credential_env: STALWART_OWNER_PASSWORD
             smtp_credential_env: STALWART_SMTP_PASSWORD
+            # Optional private CA; verification and hostname checks remain on.
+            tls_ca_bundle_file: /run/hermes/trust/stalwart-local-ca.pem
 ```
 
 `credential_env` and `smtp_credential_env` are **environment-variable references**, not credential values. The HTTP transport uses Basic owner authentication over verified TLS; provision the owner password and SMTP password in the profile's secret environment before enabling the plugin. `source_credential_env` likewise points to an approved HTTPS ICS bearer URL in secret storage; it is never a model input. The plugin's `check_fn` stays unavailable until its binding is valid and the owner/SMTP references resolve. The configured hostname, including local SMTPS, must present a hostname-valid trusted certificate; this package does not disable verification for a self-signed loopback listener. Do not configure this plugin for Sharik: Personal Workbench is the Sharik-facing policy layer and must expose only `personal_*` tools.
@@ -50,15 +54,16 @@ plugins:
 ## Guarantees and limits
 
 - Native handlers always return JSON envelopes and resolve the active profile binding at call time.
-- JMAP authenticates as the mailbox owner over verified TLS, discovers the session `apiUrl` and allows only same-origin API calls. Folder lookups are by configured name; list/search results are bounded. Drafts are retrieved by exact JMAP ID after creation.
+- JMAP authenticates as the mailbox owner over verified TLS, discovers the session `apiUrl` and allows only same-origin API calls. Read folders are configured by name; special Drafts/Sent mailboxes resolve by standard JMAP roles (or an opaque operator-bound ID). Drafts are retrieved by exact JMAP ID after creation.
+- Seen-state changes use JMAP `Email/set` followed by an exact `Email/get` keyword read-back. The adapter compares presence of `$seen` to the requested Boolean; it never compares the keywords map itself to a Boolean.
 - SMTP uses `SMTP_SSL` with certificate verification. `submission: accepted` means the local SMTP server accepted submission; it never claims remote delivery.
 - Stalwart SMTP does not necessarily save a Sent copy. After SMTP accepts a message, the adapter creates a Sent Items record with JMAP, then queries/reads the exact Message-ID, recipient and Sent membership. Uncertain outcomes are held for operator reconciliation and never resubmitted under the same key.
 - A durable SQLite idempotency record is written before a validated write. Reusing a key for a different payload fails; a retry after an uncertain/send-readback outcome returns opaque reconciliation-required status and never submits a duplicate.
-- CalDAV paths use Stalwart’s documented `/dav/cal/<account>/<calendar-slug>/<uid>.ics` layout, use ETags for PUT/DELETE, and read back exact writes/deletes. Calendar listing uses bounded `calendar-query` REPORT.
+- CalDAV paths use Stalwart’s documented `/dav/cal/<account>/<calendar-slug>/<uid>.ics` layout, use ETags for PUT/DELETE, and read back exact writes/deletes. The only model-facing read is `personal_calendar_query`: required offset-aware range, server-side `time-range`, compact projection, 31-day/50-result/8-KiB bounds, and no raw ICS.
 - Read-only calendar resources are rejected before generic write transport invocation. Only the configured ICS reflector may write its reference mirror, with an ownership manifest and conditional ETags.
 - Invitation output uses RFC 5545 CRLF/UTF-8-safe 75-octet folding, organizer/attendee, sequence, and REQUEST/CANCEL methods; MIME is `multipart/alternative` with `text/calendar` method parameter.
 - External ICS registration takes a **configured**, not model-supplied, secret environment reference and returns an opaque bridge ID. The bridge refresh tool pins public DNS IPs at TCP connect with SNI/hostname validation and checks every redirect. It refuses unowned event overwrites/deletes and reads back all changes; URL and payload are absent from state/results. No native Stalwart subscription is claimed.
-- **Known feed-compatibility limit:** the strict UTF-8 parser accepts simple UTC/basic-date VEVENT feeds only. VTIMEZONE blocks, recurrence exceptions sharing a UID, and timezone-local DTSTART are rejected, not silently misrepresented. Validate an approved synthetic equivalent of the actual feed grammar before Auxiliary deployment.
+- **Feed compatibility:** the bridge supports VTIMEZONE-declared IANA zones, weekly recurrence, and one-off recurrence exceptions within a bounded 31-day expansion. Unsupported grammar fails closed; validate the synthetic DST/recurrence fixture before deployment.
 - Errors are opaque: no endpoint, raw HTTP status/body, URL, credential, mail content, or stack trace is returned.
 
 ## Verification
@@ -70,7 +75,7 @@ uv run --locked python -m unittest discover -s tests -v
 hermes plugins doctor . --ci
 ```
 
-Tests use synthetic account identifiers, fake JMAP/SMTP/CalDAV transport records, plugin registration/dispatch, profile isolation, idempotency replay/ambiguity, ownership denial, UTF-8 ICS folding, and SSRF policy checks. They do not connect to Stalwart or use secrets.
+Tests use synthetic account identifiers, fake JMAP/SMTP/CalDAV transport records, seen/unseen keyword read-back, calendar Sent-copy verification, plugin registration/dispatch, profile isolation, idempotency replay/ambiguity, ownership denial, UTF-8 ICS folding, and SSRF policy checks. They do not connect to Stalwart or use secrets.
 
 ## Controlled install / rollback
 

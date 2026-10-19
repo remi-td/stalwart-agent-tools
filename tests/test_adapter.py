@@ -7,7 +7,9 @@ from stalwart_agent_tools.core import (CalendarBinding, IdempotencyStore, Policy
 class FakeTransport:
  def __init__(self): self.calls=[]; self.events={}; self.sent=[]
  def jmap_query(self,*x): self.calls.append(("query",x)); return {"list":[]}
+ def prepare_mailboxes(self,*roles): self.calls.append(("prepare",roles))
  def jmap_draft(self,*x): self.calls.append(("draft",x)); return {"draft_id":"d1","read_back":True}
+ def jmap_set_seen(self,message_id,seen): self.calls.append(("seen",message_id,seen)); return {"message_id":message_id,"seen":seen,"read_back":True}
  def smtp_submit(self,r,s,t,mid,ical=None): self.calls.append(("smtp",r,mid)); self.sent.append({"message_id":mid,"recipient":r,"id":"sent1"})
  def append_sent(self,*x): self.calls.append(("sent-copy",x)); return "sent1"
  def find_sent(self,mid,r): return [x for x in self.sent if x["message_id"]==mid and x["recipient"]==r]
@@ -29,6 +31,12 @@ class AdapterTests(unittest.TestCase):
  def test_send_readback_and_atomic_replay(self):
   f=FakeTransport();a=adapter(f);one=a.send("ok@example.test","subject","body","abcdefgh");two=a.send("ok@example.test","subject","body","abcdefgh")
   self.assertTrue(one["sent_copy_verified"]);self.assertEqual(one,two);self.assertEqual(len([x for x in f.calls if x[0]=="smtp"]),1)
+ def test_seen_state_readback_and_atomic_replay(self):
+  f=FakeTransport();a=adapter(f)
+  one=a.set_seen("m1",True,"abcdefgh");two=a.set_seen("m1",True,"abcdefgh")
+  self.assertEqual(one,{"message_id":"m1","seen":True,"read_back":True});self.assertEqual(one,two)
+  self.assertEqual([x for x in f.calls if x[0]=="seen"],[("seen","m1",True)])
+  with self.assertRaises(PolicyError):a.set_seen("m1",False,"abcdefgh")
  def test_key_reuse_different_payload_denied(self):
   f=FakeTransport();a=adapter(f)
   a.send("ok@example.test","subject","body","abcdefgh")
@@ -49,6 +57,12 @@ class AdapterTests(unittest.TestCase):
   f=FakeTransport();a=adapter(f);self.assertTrue(a.draft("ok@example.test","s","b","abcdefgh")["read_back"])
   with self.assertRaises(PolicyError):a.calendar_upsert("reference",{"uid":"u","summary":"x","start":"20260101T010000Z","end":"20260101T020000Z"},"abcdefgh")
   self.assertFalse(f.events)
+ def test_calendar_invitation_has_verified_sent_copy(self):
+  f=FakeTransport();a=adapter(f);event={"uid":"u","summary":"appointment","start":"20260101T010000Z","end":"20260101T020000Z"}
+  result=a.send_invitation("ok@example.test",event,"abcdefgh")
+  sent=[call for call in f.calls if call[0]=="sent-copy"]
+  self.assertTrue(result["sent_copy_verified"]);self.assertEqual(len(sent),1)
+  self.assertIn("METHOD:REQUEST",sent[0][1][4])
  def test_calendar_readback_and_delete(self):
   a=adapter();event={"uid":"u","summary":"x","start":"20260101T010000Z","end":"20260101T020000Z"};self.assertTrue(a.calendar_upsert("planning",event,"abcdefgh")["read_back"]);self.assertTrue(a.calendar_delete("planning","u","ijklmnop")["deleted"])
  def test_ics_unicode_folding_and_cancel(self):

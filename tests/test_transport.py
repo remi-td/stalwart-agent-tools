@@ -8,7 +8,7 @@ from stalwart_agent_tools.core import StalwartTransport, TransportError, Calenda
 from test_adapter import policy
 
 class HttpFixture:
-    def __init__(self): self.calls=[]; self.fail_readback=False
+    def __init__(self): self.calls=[]; self.fail_readback=False; self.seen={"e1":False}
     def request(self,url,method,*,headers,body=None):
         import json
         self.calls.append((url,method,body))
@@ -16,13 +16,22 @@ class HttpFixture:
             return 200,{},json.dumps({'apiUrl':'https://mail.example.test/jmap/api','accounts':{'acc':{}}}).encode()
         if method=='POST':
             data=json.loads(body); name,args,_=data['methodCalls'][0]
-            if name=='Mailbox/get': result={'list':[{'id':'in','name':'Inbox'},{'id':'d','name':'Drafts'},{'id':'s','name':'Sent'}]}
+            if name=='Mailbox/get': result={'list':[{'id':'in','name':'Inbox'},{'id':'d','name':'Brouillons','role':'drafts'},{'id':'s','name':'Sent Items','role':'sent'}]}
             elif name=='Email/query':
                 self.query=args
                 result={'ids':['e1'] if args['filter'].get('inMailbox')=='in' else ['sent1']}
             elif name=='Email/get':
-                result={'list': [] if self.fail_readback else ([{'id':'e1','subject':'hello','from':[],'keywords':{}}] if args['ids']==['e1'] else [{'id':args['ids'][0],'subject':'subject','to':[{'email':'ok@example.test'}],'mailboxIds':{'d':True,'s':True},'keywords':{'$draft':True},'bodyValues':{'1':{'value':'body'}},'messageId':['mid@example.test']}])}
-            elif name=='Email/set': result={'created':{list(args['create'])[0]:{'id':'draft1'}}}
+                if args.get('properties') == ['id','keywords']:
+                    email_id=args['ids'][0]
+                    result={'list':[{'id':email_id,'keywords':{'$seen':True} if self.seen[email_id] else {}}]}
+                else:
+                    result={'list': [] if self.fail_readback else ([{'id':'e1','subject':'hello','from':[],'keywords':{}}] if args['ids']==['e1'] else [{'id':args['ids'][0],'subject':'subject','to':[{'email':'ok@example.test'}],'mailboxIds':{'d':True,'s':True},'keywords':{'$draft':True},'bodyValues':{'1':{'value':'body'}},'messageId':['mid@example.test']}])}
+            elif name=='Email/set':
+                if 'update' in args:
+                    email_id, patch=next(iter(args['update'].items()))
+                    self.seen[email_id]=patch['keywords/$seen']
+                    result={'updated':{email_id:None}}
+                else: result={'created':{list(args['create'])[0]:{'id':'draft1'}}}
             else: raise AssertionError(name)
             return 200,{},json.dumps({'methodResponses':[[name,result,'x']]}).encode()
         if method=='GET': return 200,{'etag':'"v1"'},b'BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n'
@@ -42,10 +51,15 @@ class TransportContracts(unittest.TestCase):
         self.assertTrue(result['read_back'])
         self.fixture.fail_readback=True
         with self.assertRaises(TransportError): self.t.jmap_draft('ok@example.test','subject','body','abcdefgh')
+    def test_jmap_seen_state_is_reported_from_keyword_membership(self):
+        self.assertEqual(self.t.jmap_set_seen('e1',True), {'message_id':'e1','seen':True,'read_back':True})
+        self.assertTrue(self.fixture.seen['e1'])
+        self.assertEqual(self.t.jmap_set_seen('e1',False), {'message_id':'e1','seen':False,'read_back':True})
+        self.assertFalse(self.fixture.seen['e1'])
     def test_caldav_conditional_write(self):
         b=CalendarBinding('p','plan',True,True)
         self.assertEqual(self.t.caldav_put(b,'uid','BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n'), '"v2"')
-        self.assertEqual(self.t.caldav_list(b),[])
+        self.assertEqual(self.t.caldav_query(b, __import__('datetime').datetime(2026,1,1,tzinfo=__import__('datetime').timezone.utc), __import__('datetime').datetime(2026,1,2,tzinfo=__import__('datetime').timezone.utc), ('summary','start','end'), 10),[])
         self.assertEqual(self.t.caldav_get(b,'uid')['etag'],'"v1"')
         self.t.caldav_delete(b,'uid','"v1"')
     def test_jmap_rejects_cross_origin_api(self):

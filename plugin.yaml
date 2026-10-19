@@ -1,5 +1,5 @@
 name: stalwart-agent-tools
-version: 0.2.0
+version: 0.3.0
 description: Profile-scoped JMAP, verified local SMTP submission, CalDAV, and constrained ICS bridge for explicitly bound non-family profiles.
 author: Local
 kind: backend
@@ -7,10 +7,11 @@ requires_hermes: ">=0.21.5"
 provides_tools:
   - stalwart_mail_list
   - stalwart_mail_search
+  - stalwart_mail_set_seen
   - stalwart_mail_draft
   - stalwart_mail_send
   - stalwart_mail_send_calendar_invitation
-  - stalwart_calendar_list
+  - personal_calendar_query
   - stalwart_calendar_upsert
   - stalwart_calendar_delete
   - stalwart_calendar_subscribe_external
