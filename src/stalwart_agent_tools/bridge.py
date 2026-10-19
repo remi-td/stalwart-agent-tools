@@ -67,7 +67,7 @@ def _public(host: str, resolver: Callable[[str], list[str]]) -> tuple[str, ...]:
 
 def validate_source_url(source_url: Any, allowed_hosts: frozenset[str] | set[str], resolver: Callable[[str], list[str]]) -> tuple[str, tuple[str, ...]]:
     """Validate one redirect hop and return its normalized host plus public IPs."""
-    if not isinstance(source_url, str) or not source_url or len(source_url) > 2048:
+    if not isinstance(source_url, str) or not source_url or len(source_url) > 2048 or any(ord(ch)<32 or ord(ch)==127 for ch in source_url):
         _error("invalid source")
     parsed = urlparse(source_url)
     if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
@@ -255,6 +255,9 @@ class OwnershipManifest:
         self.lock = threading.Lock()
         self.db.execute("CREATE TABLE IF NOT EXISTS source (id TEXT PRIMARY KEY, etag TEXT)")
         self.db.execute("CREATE TABLE IF NOT EXISTS owned (source_id TEXT NOT NULL, uid TEXT NOT NULL, etag TEXT, digest TEXT NOT NULL, PRIMARY KEY(source_id,uid))")
+    def __del__(self):
+        db=getattr(self,"db",None)
+        if db is not None:db.close()
     def validator(self, source_id: str) -> str | None:
         row = self.db.execute("SELECT etag FROM source WHERE id=?", (source_id,)).fetchone()
         return row[0] if row else None
@@ -298,6 +301,9 @@ def refresh(source_url: str, allowed_hosts: frozenset[str] | set[str], target: C
         if old is None and remote is not None:
             skipped += 1  # A non-bridge event always wins over the remote feed.
             continue
+        if old is not None and remote is not None and _digest(remote.get("icalendar", "")) != old[1]:
+            skipped += 1  # Never overwrite an event edited since the last reflection.
+            continue
         if old is not None and old[1] == digest and remote is not None:
             continue
         try:
@@ -328,5 +334,8 @@ def refresh(source_url: str, allowed_hosts: frozenset[str] | set[str], target: C
             _error("calendar delete verification failed", TransportError)
         manifest.remove(source_id, uid)
         deleted += 1
-    manifest.set_validator(source_id, response.headers.get("etag"))
+    etag=response.headers.get("etag")
+    if etag is not None and (len(etag)>128 or any(ord(ch)<32 or ord(ch)>126 for ch in etag) or "://" in etag):
+        etag=None
+    manifest.set_validator(source_id, etag)
     return {"not_modified": False, "created": created, "updated": updated, "deleted": deleted, "skipped": skipped}

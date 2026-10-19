@@ -99,7 +99,12 @@ def invitation_ics(event: dict[str, Any], recipient: str, organizer: str) -> str
     if not _UID.fullmatch(uid): raise PolicyError("invalid event")
     summary = _require_text(event.get("summary"), "summary", 500)
     start, end = _require_text(event.get("start"), "start", 32), _require_text(event.get("end"), "end", 32)
-    if not re.fullmatch(r"\d{8}T\d{6}Z", start) or not re.fullmatch(r"\d{8}T\d{6}Z", end) or end <= start: raise PolicyError("invalid event")
+    if not re.fullmatch(r"\d{8}T\d{6}Z", start) or not re.fullmatch(r"\d{8}T\d{6}Z", end): raise PolicyError("invalid event")
+    try:
+        begin=datetime.strptime(start,"%Y%m%dT%H%M%SZ")
+        finish=datetime.strptime(end,"%Y%m%dT%H%M%SZ")
+    except ValueError as exc:raise PolicyError("invalid event") from exc
+    if finish<=begin:raise PolicyError("invalid event")
     method = event.get("method", "REQUEST")
     if method not in ("REQUEST", "CANCEL"): raise PolicyError("invalid event")
     sequence = event.get("sequence", 0)
@@ -113,6 +118,9 @@ class CalendarBinding:
     slug: str
     read: bool
     write: bool
+    def __post_init__(self):
+        if not isinstance(self.calendar_id,str) or not self.calendar_id or not isinstance(self.slug,str) or not _LOGICAL.fullmatch(self.slug):raise PolicyError("invalid calendar binding")
+        if type(self.read) is not bool or type(self.write) is not bool or (self.write and not self.read):raise PolicyError("invalid calendar binding")
 @dataclass(frozen=True)
 class ProfilePolicy:
     profile: str; account_id: str; account_name: str; organizer: str
@@ -121,7 +129,7 @@ class ProfilePolicy:
     jmap_url: str; caldav_base_url: str; smtp_host: str; smtp_port: int
     credential_env: str; smtp_credential_env: str | None = None
     def __post_init__(self):
-        if not _LOGICAL.fullmatch(self.profile) or not self.account_id or not self.account_name: raise PolicyError("invalid profile binding")
+        if not _LOGICAL.fullmatch(self.profile) or not isinstance(self.account_id,str) or not self.account_id or not isinstance(self.account_name,str) or not self.account_name or ".." in self.account_name or not re.fullmatch(r"[A-Za-z0-9@._+-]{1,320}",self.account_name): raise PolicyError("invalid profile binding")
         _email(self.organizer)
         if not self.allowed_recipients or any(_email(x) != x for x in self.allowed_recipients): raise PolicyError("invalid profile binding")
         if not self.folders or any(not isinstance(x,str) or len(x)>100 for x in self.folders): raise PolicyError("invalid profile binding")
@@ -144,8 +152,15 @@ def resolve_policy(profile: str, config: Any) -> ProfilePolicy:
     recipients = frozenset(_email(x) for x in mail.get("allowed_recipients", []))
     rawc=config.get("calendars",{})
     if not isinstance(rawc,dict): raise PolicyError("invalid profile binding")
-    calendars={k: CalendarBinding(str(v.get("calendar_id","")),str(v.get("slug","")),bool(v.get("read")),bool(v.get("write"))) for k,v in rawc.items() if isinstance(v,dict)}
-    return ProfilePolicy(profile, str(mail.get("account_id","")), str(mail.get("account_name","")), _email(mail.get("organizer","")), recipients, frozenset(mail.get("folders", ["Inbox","Junk Mail","Sent"])), calendars, frozenset(str(x).lower().rstrip(".") for x in config.get("bridge_hosts",[])), str(transport.get("jmap_url","")), str(transport.get("caldav_base_url","")), str(transport.get("smtp_host","")), transport.get("smtp_port",465), str(transport.get("credential_env","")), transport.get("smtp_credential_env"))
+    calendars={}
+    for k,v in rawc.items():
+        if not isinstance(k,str) or not isinstance(v,dict):raise PolicyError("invalid calendar binding")
+        cid,slug,read,write=(v.get(x) for x in ("calendar_id","slug","read","write"))
+        if not isinstance(cid,str) or not isinstance(slug,str) or type(read) is not bool or type(write) is not bool:raise PolicyError("invalid calendar binding")
+        calendars[k]=CalendarBinding(cid,slug,read,write)
+    credential_env=transport.get("credential_env")
+    if not isinstance(mail.get("account_id"),str) or not isinstance(mail.get("account_name"),str) or not isinstance(credential_env,str):raise PolicyError("invalid profile binding")
+    return ProfilePolicy(profile, mail["account_id"], mail["account_name"], _email(mail.get("organizer","")), recipients, frozenset(mail.get("folders", ["Inbox","Junk Mail","Sent"])), calendars, frozenset(str(x).lower().rstrip(".") for x in config.get("bridge_hosts",[])), str(transport.get("jmap_url","")), str(transport.get("caldav_base_url","")), str(transport.get("smtp_host","")), transport.get("smtp_port",465), credential_env, transport.get("smtp_credential_env"))
 
 class JsonHttp:
     """Verified TLS JSON client. Endpoints are policy-owned, never model supplied."""
@@ -162,43 +177,86 @@ class JsonHttp:
 class StalwartTransport:
     def __init__(self, policy: ProfilePolicy, http: JsonHttp | None = None): self.policy,self.http=policy,http or JsonHttp(); self._session=None
     def _auth(self, env: str | None = None) -> dict[str,str]:
-        raw=_secret_env(env or self.policy.credential_env); return {"Authorization":"Bearer "+raw, "Accept":"application/json"}
+        password = _secret_env(env or self.policy.credential_env)
+        token = base64.b64encode(f"{self.policy.organizer}:{password}".encode()).decode("ascii")
+        return {"Authorization": "Basic " + token, "Accept": "application/json"}
     def _jmap(self) -> tuple[str, dict[str,Any]]:
         if self._session: return self._session
         status,_,raw=self.http.request(self.policy.jmap_url,"GET",headers=self._auth())
         if status != 200: raise TransportError("transport unavailable")
         try: session=json.loads(raw); api=session["apiUrl"]
         except Exception as exc: raise TransportError("transport unavailable") from exc
-        origin=lambda u: (urlparse(u).scheme,urlparse(u).hostname,urlparse(u).port)
-        if origin(api) != origin(self.policy.jmap_url): raise TransportError("transport unavailable")
+        origin=lambda u: (urlparse(u).scheme,urlparse(u).hostname,urlparse(u).port or 443)
+        if origin(api) != origin(self.policy.jmap_url) or origin(api)[0] != "https": raise TransportError("transport unavailable")
+        accounts=session.get("accounts",{})
+        if self.policy.account_id not in accounts: raise TransportError("account unavailable")
         self._session=(api,session); return self._session
     def _call(self, calls: list[list[Any]]) -> list[Any]:
-        api,session=self._jmap(); payload=json.dumps({"using":session.get("capabilities",{}).keys(),"methodCalls":calls}).encode()
+        api,_=self._jmap()
+        payload=json.dumps({"using":["urn:ietf:params:jmap:core","urn:ietf:params:jmap:mail"],"methodCalls":calls}).encode()
         h=self._auth(); h["Content-Type"]="application/json"; status,_,raw=self.http.request(api,"POST",headers=h,body=payload)
         if status != 200: raise TransportError("transport unavailable")
-        try:return json.loads(raw)["methodResponses"]
-        except Exception as exc: raise TransportError("transport unavailable") from exc
+        try:
+            response=json.loads(raw)["methodResponses"]
+            if len(response)!=len(calls) or any(item[0]=="error" or item[0]!=call[0] for item,call in zip(response,calls)):
+                raise TransportError("JMAP method failed")
+            return [item[1] for item in response]
+        except (KeyError, IndexError, TypeError, ValueError) as exc: raise TransportError("transport unavailable") from exc
+    def _folder_id(self, folder: str) -> str:
+        result=self._call([["Mailbox/get",{"accountId":self.policy.account_id,"ids":None},"m"]])[0]
+        matches=[item["id"] for item in result.get("list",[]) if item.get("name"," ").casefold()==folder.casefold()]
+        if len(matches)!=1: raise TransportError("configured folder unavailable")
+        return matches[0]
     def jmap_query(self, folder: str, query: str | None, limit: int):
-        # Folder names are fixed profile policy; resolve mailbox at server side by name filter.
-        args={"accountId":self.policy.account_id,"filter":{"inMailboxOtherThan":[]},"limit":limit,"sort":[{"property":"receivedAt","isAscending":False}]}
-        if query: args["filter"]={"text":query}
-        return self._call([["Email/query",args,"q"]])
+        fid=self._folder_id(folder)
+        filt={"inMailbox":fid}
+        if query: filt={"operator":"AND","conditions":[filt,{"text":query}]}
+        args={"accountId":self.policy.account_id,"filter":filt,"limit":limit,"sort":[{"property":"receivedAt","isAscending":False}]}
+        result=self._call([["Email/query",args,"q"]])[0]
+        ids=result.get("ids",[])
+        if not isinstance(ids,list) or len(ids)>limit: raise TransportError("transport unavailable")
+        if not ids: return {"total":result.get("total",0),"messages":[]}
+        got=self._call([["Email/get",{"accountId":self.policy.account_id,"ids":ids,"properties":["id","subject","from","receivedAt","preview","keywords"]},"g"]])[0]
+        return {"total":result.get("total"),"messages":[{"id":e["id"],"subject":e.get("subject", ""),"from":e.get("from", []),"received_at":e.get("receivedAt"),"preview":(e.get("preview") or "")[:200],"unread":"$seen" not in e.get("keywords",{})} for e in got.get("list",[])]}
     def jmap_draft(self, recipient:str, subject:str, text:str, idem:str):
-        email={"mailboxIds":{},"to":[{"email":recipient}],"subject":subject,"textBody":[{"partId":"1","type":"text/plain"}],"bodyValues":{"1":{"value":text}},"keywords":{"$draft":True},"header:Message-ID:asMessageIds":[f"<{idem}@local>"]}
-        return self._call([["Email/set",{"accountId":self.policy.account_id,"create":{"draft":email}},"d"]])
+        fid=self._folder_id("Drafts")
+        email={"mailboxIds":{fid:True},"from":[{"email":self.policy.organizer}],"to":[{"email":recipient}],"subject":subject,"textBody":[{"partId":"1","type":"text/plain"}],"bodyValues":{"1":{"value":text}},"keywords":{"$draft":True}}
+        created=self._call([["Email/set",{"accountId":self.policy.account_id,"create":{"draft":email}},"d"]])[0].get("created",{}).get("draft")
+        if not isinstance(created,dict) or not created.get("id"): raise TransportError("draft creation failed")
+        eid=created["id"]
+        got=self._call([["Email/get",{"accountId":self.policy.account_id,"ids":[eid],"properties":["id","subject","to","mailboxIds","keywords","textBody","bodyValues"],"fetchTextBodyValues":True},"g"]])[0].get("list",[])
+        if len(got)!=1 or got[0].get("id")!=eid or got[0].get("subject")!=subject or got[0].get("to")!=[{"email":recipient}] or fid not in got[0].get("mailboxIds",{}) or "$draft" not in got[0].get("keywords",{}): raise TransportError("draft read-back failed")
+        values=got[0].get("bodyValues",{})
+        if text not in [part.get("value") for part in values.values()]: raise TransportError("draft read-back failed")
+        return {"draft_id":eid,"read_back":True}
     def smtp_submit(self, recipient:str, subject:str, text:str, message_id:str, calendar: str | None = None):
         msg=EmailMessage(); msg["From"]=self.policy.organizer; msg["To"]=recipient; msg["Subject"]=subject; msg["Message-ID"]=message_id
-        if calendar: msg.set_content(calendar,subtype="calendar",params={"method":"REQUEST","charset":"utf-8"})
+        if calendar:
+            msg.set_content("Calendar invitation attached.")
+            method="CANCEL" if "METHOD:CANCEL\r\n" in calendar else "REQUEST"
+            msg.add_alternative(calendar,subtype="calendar",charset="utf-8",params={"method":method,"component":"VEVENT"})
         else: msg.set_content(text)
         password=_secret_env(self.policy.smtp_credential_env or self.policy.credential_env)
         try:
             with smtplib.SMTP_SSL(self.policy.smtp_host,self.policy.smtp_port,context=ssl.create_default_context(),timeout=15) as client:
-                client.login(self.policy.organizer,password); client.send_message(msg)
+                client.login(self.policy.organizer,password)
+                refused=client.send_message(msg,from_addr=self.policy.organizer,to_addrs=[recipient])
+                if refused: raise AmbiguousSubmission("submission outcome unknown")
         except (OSError,smtplib.SMTPException) as exc: raise AmbiguousSubmission("submission outcome unknown") from exc
     def find_sent(self, message_id:str, recipient:str):
-        # Server-created or externally synchronized Sent copy only; never synthesize it here.
-        result=self._call([["Email/query",{"accountId":self.policy.account_id,"filter":{"header":["Message-ID",message_id]},"limit":10},"q"]])
-        return result
+        fid=self._folder_id("Sent")
+        query=self._call([["Email/query",{"accountId":self.policy.account_id,"filter":{"operator":"AND","conditions":[{"inMailbox":fid},{"header":["Message-ID",message_id]}]},"limit":10},"q"]])[0]
+        ids=query.get("ids",[])
+        if not ids: return []
+        result=self._call([["Email/get",{"accountId":self.policy.account_id,"ids":ids,"properties":["id","messageId","to","mailboxIds"]},"g"]])[0]
+        expected=message_id.strip("<>")
+        return [{"id":e["id"]} for e in result.get("list",[]) if expected in (e.get("messageId") or []) and any(_email(x.get("email"))==recipient for x in e.get("to",[])) and fid in e.get("mailboxIds",{})]
+    def append_sent(self, recipient:str, subject:str, text:str, message_id:str, calendar:str|None=None):
+        fid=self._folder_id("Sent")
+        entry={"mailboxIds":{fid:True},"keywords":{"$seen":True},"from":[{"email":self.policy.organizer}],"to":[{"email":recipient}],"subject":subject,"messageId":[message_id.strip("<>")],"sentAt":datetime.now(timezone.utc).isoformat().replace("+00:00","Z"),"bodyValues":{"plain":{"value":text or "Calendar invitation attached."}},"textBody":[{"partId":"plain","type":"text/plain"}]}
+        created=self._call([["Email/set",{"accountId":self.policy.account_id,"create":{"sent":entry}},"s"]])[0].get("created",{}).get("sent")
+        if not isinstance(created,dict) or not created.get("id"): raise AmbiguousSubmission("sent copy creation unknown")
+        return created["id"]
     def _cal_url(self,binding:CalendarBinding,uid:str|None=None)->str:
         root=self.policy.caldav_base_url.rstrip("/") + "/dav/cal/" + quote(self.policy.account_name,safe="") + "/" + quote(binding.slug,safe="") + "/"
         return root + (quote(uid,safe="._-")+".ics" if uid else "")
@@ -220,6 +278,33 @@ class StalwartTransport:
         if status==412: raise ConflictError("concurrent modification")
         if status not in (200,204,404): raise TransportError("transport unavailable")
 
+    def caldav_list(self,binding,limit=50):
+        import xml.etree.ElementTree as ET
+        request=b'''<?xml version="1.0"?><c:calendar-query xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav"><d:prop><d:getetag/><c:calendar-data/></d:prop><c:filter><c:comp-filter name="VCALENDAR"><c:comp-filter name="VEVENT"/></c:comp-filter></c:filter></c:calendar-query>'''
+        status,_,raw=self._dav(self._cal_url(binding),"REPORT",request,{"Depth":"1","Content-Type":"application/xml"})
+        if status!=207 or len(raw)>1_000_000 or b"<!DOCTYPE" in raw.upper() or b"<!ENTITY" in raw.upper():raise TransportError("calendar query failed")
+        try:
+            tree=ET.fromstring(raw)
+            ns={"d":"DAV:","c":"urn:ietf:params:xml:ns:caldav"}
+            records=[]
+            for node in tree.findall("d:response",ns):
+                data=node.find(".//c:calendar-data",ns)
+                if data is not None and data.text:
+                    records.append({"icalendar":data.text[:20000]})
+                    if len(records)>=limit:break
+            return records
+        except ET.ParseError as exc:raise TransportError("calendar query failed") from exc
+
+class CalDAVBridgeTarget:
+    """Bridge-only facade. The reflected reference calendar is never writable by
+    generic calendar tools; only this operator-configured mirror target writes it.
+    """
+    def __init__(self, transport:StalwartTransport, binding:CalendarBinding):
+        self.transport=transport;self.binding=binding
+    def get(self,uid):return self.transport.caldav_get(self.binding,uid)
+    def put(self,uid,icalendar,etag=None):return self.transport.caldav_put(self.binding,uid,icalendar,etag)
+    def delete(self,uid,etag):return self.transport.caldav_delete(self.binding,uid,etag)
+
 class IdempotencyStore:
     """Durable SQLite record with pending-before-submit semantics.
 
@@ -229,17 +314,26 @@ class IdempotencyStore:
     def __init__(self,path:Path):
         import sqlite3
         path.parent.mkdir(parents=True,exist_ok=True); self.db=sqlite3.connect(path,check_same_thread=False,isolation_level=None); self.lock=threading.Lock()
-        self.db.execute("CREATE TABLE IF NOT EXISTS operations(k TEXT PRIMARY KEY, state TEXT NOT NULL, result TEXT)")
-    def start(self,key:str):
+        self.db.execute("CREATE TABLE IF NOT EXISTS operations(k TEXT PRIMARY KEY, state TEXT NOT NULL, result TEXT, fingerprint TEXT)")
+        columns={row[1] for row in self.db.execute("PRAGMA table_info(operations)")}
+        if "fingerprint" not in columns:self.db.execute("ALTER TABLE operations ADD COLUMN fingerprint TEXT")
+    def __del__(self):
+        db=getattr(self,"db",None)
+        if db is not None:db.close()
+    def start(self,key:str,fingerprint:str):
         with self.lock:
-            self.db.execute("BEGIN IMMEDIATE"); row=self.db.execute("SELECT state,result FROM operations WHERE k=?",(key,)).fetchone()
+            self.db.execute("BEGIN IMMEDIATE"); row=self.db.execute("SELECT state,result,fingerprint FROM operations WHERE k=?",(key,)).fetchone()
             if row:
                 self.db.execute("COMMIT")
+                if row[2]!=fingerprint:raise PolicyError("idempotency key reused with different request")
                 if row[0]=="done": return json.loads(row[1])
                 raise AmbiguousSubmission("previous operation requires reconciliation")
-            self.db.execute("INSERT INTO operations VALUES(?,?,NULL)",(key,"pending"));self.db.execute("COMMIT");return None
+            self.db.execute("INSERT INTO operations(k,state,result,fingerprint) VALUES(?,'pending',NULL,?)",(key,fingerprint));self.db.execute("COMMIT");return None
     def finish(self,key:str,result:dict):
         with self.lock:self.db.execute("UPDATE operations SET state='done',result=? WHERE k=?",(json.dumps(result),key))
+
+def _fingerprint(*values:Any) -> str:
+    return hashlib.sha256(json.dumps(values,sort_keys=True,ensure_ascii=False).encode()).hexdigest()
 
 class StalwartAdapter:
     def __init__(self, policy:ProfilePolicy, transport:Any, store:IdempotencyStore, *, resolver:Callable[[str],list[str]]=lambda h:[x[4][0] for x in socket.getaddrinfo(h,443,type=socket.SOCK_STREAM)]): self.policy,self.transport,self.store,self.resolver=policy,transport,store,resolver
@@ -250,7 +344,7 @@ class StalwartAdapter:
     def _calendar(self,name,write=False):
         if not isinstance(name,str) or name not in self.policy.calendars:raise PolicyError("unknown calendar resource")
         value=self.policy.calendars[name]
-        if write and not value.write:raise PolicyError("calendar resource not writable")
+        if (write and not value.write) or (not write and not value.read):raise PolicyError("calendar resource unavailable")
         return value
     def list_mail(self,folder="Inbox",limit=20):
         if folder not in self.policy.folders or not isinstance(limit,int) or not 1<=limit<=100:raise PolicyError("invalid mail query")
@@ -260,39 +354,55 @@ class StalwartAdapter:
         if folder not in self.policy.folders or not isinstance(limit,int) or not 1<=limit<=100:raise PolicyError("invalid mail query")
         return self.transport.jmap_query(folder,query,limit)
     def draft(self,recipient,subject,text,idempotency_key):
-        key=_key(idempotency_key); prior=self.store.start("draft:"+key)
+        r=self._recipient(recipient); subject=_require_text(subject,"subject",500);text=_require_text(text,"text");key=_key(idempotency_key)
+        op="draft:"+key;prior=self.store.start(op,_fingerprint(r,subject,text))
         if prior:return prior
-        result={"draft":self.transport.jmap_draft(self._recipient(recipient),_require_text(subject,"subject",500),_require_text(text,"text"),key),"read_back":True};self.store.finish("draft:"+key,result);return result
+        result=self.transport.jmap_draft(r,subject,text,key)
+        if not result.get("read_back"):raise TransportError("draft read-back failed")
+        self.store.finish(op,result);return result
     def send(self,recipient,subject,text,idempotency_key): return self._send(recipient,subject,text,idempotency_key)
     def send_invitation(self,recipient,event,idempotency_key):
-        r=self._recipient(recipient); ical=invitation_ics(event,r,self.policy.organizer);return self._send(r,event.get("summary",""),"",idempotency_key,ical)
-    def _send(self,recipient,subject,text,key,ical=None):
-        key=_key(key); prior=self.store.start("send:"+key)
+        r=self._recipient(recipient); ical=invitation_ics(event,r,self.policy.organizer);return self._send(r,event["summary"],"",idempotency_key,ical,request_data=event)
+    def _send(self,recipient,subject,text,key,ical=None,request_data=None):
+        r=self._recipient(recipient);subject=_require_text(subject,"subject",500)
+        if not ical:text=_require_text(text,"text")
+        key=_key(key);op="send:"+key;prior=self.store.start(op,_fingerprint(r,subject,text,request_data if request_data is not None else ical))
         if prior:return prior
-        r=self._recipient(recipient); mid=f"<{key}.{uuid.uuid4().hex}@{self.policy.account_name}>"
-        self.transport.smtp_submit(r,_require_text(subject,"subject",500),_require_text(text,"text") if not ical else text,mid,ical)
+        mid=f"<{key}.{uuid.uuid4().hex}@{self.policy.organizer.split('@',1)[1]}>"
+        self.transport.smtp_submit(r,subject,text,mid,ical)
+        # Stalwart local SMTP does not necessarily save a Sent copy; append once,
+        # then read back exact Message-ID, recipient and Sent mailbox membership.
+        self.transport.append_sent(r,subject,text,mid,ical)
         found=self.transport.find_sent(mid,r)
-        # Transport returns raw JMAP query; require exact Message-ID and recipient evidence.
-        serialized=json.dumps(found)
-        if mid not in serialized or r not in serialized: raise AmbiguousSubmission("sent copy reconciliation required")
-        result={"submission":"accepted","remote_delivery":"unconfirmed","message_id":mid,"sent_copy_verified":True};self.store.finish("send:"+key,result);return result
+        if not found: raise AmbiguousSubmission("sent copy reconciliation required")
+        result={"submission":"accepted","remote_delivery":"unconfirmed","message_id":mid,"sent_id":found[0]["id"],"sent_copy_verified":True};self.store.finish(op,result);return result
     def calendar_upsert(self,resource,event,idempotency_key):
-        key=_key(idempotency_key); prior=self.store.start("calput:"+key)
-        if prior:return prior
-        b=self._calendar(resource,True); uid=_require_text(event.get("uid") if isinstance(event,dict) else None,"uid",200)
+        b=self._calendar(resource,True)
+        if not isinstance(event,dict):raise PolicyError("invalid event")
+        uid=_require_text(event.get("uid"),"uid",200)
+        if not _UID.fullmatch(uid):raise PolicyError("invalid event")
         ical=invitation_ics({**event,"method":"REQUEST"},self.policy.organizer,self.policy.organizer)
-        old=self.transport.caldav_get(b,uid); etag=self.transport.caldav_put(b,uid,ical,old.get("etag") if old else None); got=self.transport.caldav_get(b,uid)
-        if not got or got.get("uid")!=uid:raise TransportError("calendar read-back failed")
-        result={"uid":uid,"etag":etag,"read_back":True};self.store.finish("calput:"+key,result);return result
-    def calendar_delete(self,resource,uid,idempotency_key):
-        key=_key(idempotency_key);prior=self.store.start("caldel:"+key)
+        key=_key(idempotency_key);op="calput:"+key;prior=self.store.start(op,_fingerprint(resource,event))
         if prior:return prior
-        b=self._calendar(resource,True);uid=_require_text(uid,"uid",200);old=self.transport.caldav_get(b,uid)
+        old=self.transport.caldav_get(b,uid);etag=self.transport.caldav_put(b,uid,ical,old.get("etag") if old else None);got=self.transport.caldav_get(b,uid)
+        if not got or got.get("uid")!=uid or got.get("icalendar")!=ical:raise TransportError("calendar read-back failed")
+        result={"uid":uid,"etag":etag,"read_back":True};self.store.finish(op,result);return result
+    def calendar_delete(self,resource,uid,idempotency_key):
+        b=self._calendar(resource,True);uid=_require_text(uid,"uid",200)
+        if not _UID.fullmatch(uid):raise PolicyError("invalid event")
+        key=_key(idempotency_key);op="caldel:"+key;prior=self.store.start(op,_fingerprint(resource,uid))
+        if prior:return prior
+        old=self.transport.caldav_get(b,uid)
         if old:self.transport.caldav_delete(b,uid,old.get("etag"))
         if self.transport.caldav_get(b,uid) is not None:raise TransportError("calendar delete verification failed")
-        result={"uid":uid,"deleted":True};self.store.finish("caldel:"+key,result);return result
-    def calendar_list(self,resource): return self.transport.caldav_get(self._calendar(resource),"")
+        result={"uid":uid,"deleted":True};self.store.finish(op,result);return result
+    def calendar_list(self,resource): return self.transport.caldav_list(self._calendar(resource))
     def register_bridge(self,source):
         validate_bridge_url(source,self.policy.bridge_hosts,self.resolver); bid=hashlib.sha256(source.encode()).hexdigest()[:24]
-        # source storage is intentionally delegated to profile secret integration in wrapper.
         return {"bridge_id":bid,"registered":True}
+    def refresh_bridge(self,source,resource,state):
+        from .bridge import refresh
+        binding=self._calendar(resource)
+        if binding.write:raise PolicyError("bridge target must be reference-only")
+        target=CalDAVBridgeTarget(self.transport,binding)
+        return refresh(source,self.policy.bridge_hosts,target,state,resolver=self.resolver)

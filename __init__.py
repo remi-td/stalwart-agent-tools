@@ -17,9 +17,10 @@ _TOOL_ARGS = {
  "stalwart_calendar_list": {"resource":{"type":"string"}},
  "stalwart_calendar_upsert": {"resource":{"type":"string"},"event":{"type":"object"},"idempotency_key":{"type":"string","minLength":8,"maxLength":128}},
  "stalwart_calendar_delete": {"resource":{"type":"string"},"uid":{"type":"string"},"idempotency_key":{"type":"string","minLength":8,"maxLength":128}},
- "stalwart_calendar_subscribe_external": {"source_credential_env":{"type":"string","pattern":"^[A-Z][A-Z0-9_]{0,127}$"}},
+ "stalwart_calendar_subscribe_external": {},
+ "stalwart_calendar_refresh_external": {},
 }
-_REQUIRED = {"stalwart_mail_list":[],"stalwart_mail_search":["query"],"stalwart_mail_draft":["recipient","subject","text","idempotency_key"],"stalwart_mail_send":["recipient","subject","text","idempotency_key"],"stalwart_mail_send_calendar_invitation":["recipient","event","idempotency_key"],"stalwart_calendar_list":["resource"],"stalwart_calendar_upsert":["resource","event","idempotency_key"],"stalwart_calendar_delete":["resource","uid","idempotency_key"],"stalwart_calendar_subscribe_external":["source_credential_env"]}
+_REQUIRED = {"stalwart_mail_list":[],"stalwart_mail_search":["query"],"stalwart_mail_draft":["recipient","subject","text","idempotency_key"],"stalwart_mail_send":["recipient","subject","text","idempotency_key"],"stalwart_mail_send_calendar_invitation":["recipient","event","idempotency_key"],"stalwart_calendar_list":["resource"],"stalwart_calendar_upsert":["resource","event","idempotency_key"],"stalwart_calendar_delete":["resource","uid","idempotency_key"],"stalwart_calendar_subscribe_external":[],"stalwart_calendar_refresh_external":[]}
 def _schema(name):
     return {"name":name,"description":"Configured profile-scoped Stalwart operation; never accepts endpoint, account, calendar ID, or credentials.","parameters":{"type":"object","properties":_TOOL_ARGS[name],"required":_REQUIRED[name],"additionalProperties":False}}
 def _error(exc):
@@ -52,12 +53,24 @@ def register(ctx):
                 elif name=="stalwart_calendar_list": result=a.calendar_list(args["resource"])
                 elif name=="stalwart_calendar_upsert": result=a.calendar_upsert(args["resource"],args["event"],args["idempotency_key"])
                 elif name=="stalwart_calendar_delete": result=a.calendar_delete(args["resource"],args["uid"],args["idempotency_key"])
-                else:
-                    # Store only an env reference and opaque bridge id in durable profile state.
+                elif name in ("stalwart_calendar_subscribe_external","stalwart_calendar_refresh_external"):
                     import os
-                    ref=args["source_credential_env"]
-                    if not isinstance(ref,str) or not __import__('re').fullmatch(r"[A-Z][A-Z0-9_]{0,127}",ref) or not os.getenv(ref): raise PolicyError("credential unavailable")
-                    result=a.register_bridge(os.environ[ref]); ctx.state.set("ics_bridge",{"source_credential_env":ref,"bridge_id":result["bridge_id"]})
+                    bridge=ctx.get_config("binding",{}).get("bridge",{})
+                    ref=bridge.get("source_credential_env") if isinstance(bridge,dict) else None
+                    target=bridge.get("reference_resource") if isinstance(bridge,dict) else None
+                    if not isinstance(ref,str) or not __import__('re').fullmatch(r"[A-Z][A-Z0-9_]{0,127}",ref) or not os.getenv(ref) or not isinstance(target,str):raise PolicyError("bridge not configured")
+                    # Profile policy binds the source reference and target. The model supplies neither.
+                    source=os.environ[ref]
+                    if name=="stalwart_calendar_subscribe_external":
+                        a._calendar(target)
+                        if a.policy.calendars[target].write:raise PolicyError("bridge target must be reference-only")
+                        result=a.register_bridge(source)
+                        ctx.state.set("ics_bridge",{"source_credential_env":ref,"bridge_id":result["bridge_id"]})
+                    else:
+                        registered=ctx.state.get("ics_bridge",default={})
+                        if registered.get("source_credential_env")!=ref:raise PolicyError("bridge not registered")
+                        result=a.refresh_bridge(source,target,ctx.state.data_dir)
+                else:raise PolicyError("unknown operation")
                 return json.dumps({"ok":True,"result":result},separators=(",",":"))
             except Exception as exc: return json.dumps(_error(exc),separators=(",",":"))
         return handler

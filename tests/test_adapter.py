@@ -7,16 +7,19 @@ from stalwart_agent_tools.core import (CalendarBinding, IdempotencyStore, Policy
 class FakeTransport:
  def __init__(self): self.calls=[]; self.events={}; self.sent=[]
  def jmap_query(self,*x): self.calls.append(("query",x)); return {"list":[]}
- def jmap_draft(self,*x): self.calls.append(("draft",x)); return {"created":{"draft":{"id":"d1"}}}
- def smtp_submit(self,r,s,t,mid,ical=None): self.calls.append(("smtp",r,mid)); self.sent.append({"message_id":mid,"recipient":r})
- def find_sent(self,mid,r): return {"list":[x for x in self.sent if x["message_id"]==mid and x["recipient"]==r]}
+ def jmap_draft(self,*x): self.calls.append(("draft",x)); return {"draft_id":"d1","read_back":True}
+ def smtp_submit(self,r,s,t,mid,ical=None): self.calls.append(("smtp",r,mid)); self.sent.append({"message_id":mid,"recipient":r,"id":"sent1"})
+ def append_sent(self,*x): self.calls.append(("sent-copy",x)); return "sent1"
+ def find_sent(self,mid,r): return [x for x in self.sent if x["message_id"]==mid and x["recipient"]==r]
  def caldav_get(self,b,u): return self.events.get(u)
  def caldav_put(self,b,u,ical,etag=None): self.events[u]={"uid":u,"etag":"E1","icalendar":ical}; return "E1"
  def caldav_delete(self,b,u,etag): self.events.pop(u,None)
 
 def policy(): return ProfilePolicy("ops","acc","agent","agent@example.test",frozenset({"ok@example.test"}),frozenset({"Inbox","Junk Mail","Sent"}),{"planning":CalendarBinding("p","plan",True,True),"reference":CalendarBinding("r","ref",True,False)},frozenset({"safe.example"}),"https://mail.example.test/jmap/","https://mail.example.test","smtp.example.test",465,"JMAP_TOKEN")
 def adapter(fake=None):
- d=tempfile.TemporaryDirectory(); a=StalwartAdapter(policy(),fake or FakeTransport(),IdempotencyStore(Path(d.name)/"state.sqlite"),resolver=lambda h:["93.184.216.34"]);a._tmp=d;return a
+ d=tempfile.TemporaryDirectory()
+ unittest.addModuleCleanup(d.cleanup)
+ return StalwartAdapter(policy(),fake or FakeTransport(),IdempotencyStore(Path(d.name)/"state.sqlite"),resolver=lambda h:["93.184.216.34"])
 
 class AdapterTests(unittest.TestCase):
  def test_recipient_denied_before_smtp(self):
@@ -26,9 +29,18 @@ class AdapterTests(unittest.TestCase):
  def test_send_readback_and_atomic_replay(self):
   f=FakeTransport();a=adapter(f);one=a.send("ok@example.test","subject","body","abcdefgh");two=a.send("ok@example.test","subject","body","abcdefgh")
   self.assertTrue(one["sent_copy_verified"]);self.assertEqual(one,two);self.assertEqual(len([x for x in f.calls if x[0]=="smtp"]),1)
+ def test_key_reuse_different_payload_denied(self):
+  f=FakeTransport();a=adapter(f)
+  a.send("ok@example.test","subject","body","abcdefgh")
+  with self.assertRaises(PolicyError):a.send("ok@example.test","subject","changed","abcdefgh")
+  self.assertEqual(len([x for x in f.calls if x[0]=="smtp"]),1)
+ def test_reference_write_denial_does_not_poison_key(self):
+  a=adapter();event={"uid":"u","summary":"x","start":"20260101T010000Z","end":"20260101T020000Z"}
+  with self.assertRaises(PolicyError):a.calendar_upsert("reference",event,"abcdefgh")
+  self.assertTrue(a.calendar_upsert("planning",event,"abcdefgh")["read_back"])
  def test_no_duplicate_after_readback_ambiguity(self):
   class Missing(FakeTransport):
-   def find_sent(self,*x):return {"list":[]}
+   def find_sent(self,mid,r):return []
   f=Missing();a=adapter(f)
   with self.assertRaises(AmbiguousSubmission):a.send("ok@example.test","subject","body","abcdefgh")
   with self.assertRaises(AmbiguousSubmission):a.send("ok@example.test","subject","body","abcdefgh")
@@ -50,6 +62,7 @@ class AdapterTests(unittest.TestCase):
 class State:
  def __init__(self,p):self.data_dir=p;self.saved={}
  def set(self,k,v):self.saved[k]=v
+ def get(self,k,default=None):return self.saved.get(k,default)
 class Context:
  def __init__(self,name,binding,p):self.profile_name=name;self.binding=binding;self.state=State(p);self.tools={}
  def get_config(self,key,default=None):return self.binding if key=="binding" else default
@@ -67,6 +80,25 @@ class PluginTests(unittest.TestCase):
    self.assertTrue(good.tools["stalwart_mail_list"]["check_fn"]());self.assertFalse(bad.tools["stalwart_mail_list"]["check_fn"]())
    response=json.loads(bad.tools["stalwart_mail_list"]["handler"]({}))
    self.assertFalse(response["ok"]);self.assertNotIn("mail.example",json.dumps(response))
+ def test_malformed_calendar_permissions_fail_closed(self):
+  from stalwart_agent_tools.core import resolve_policy
+  config=binding()
+  config["calendars"]["planning"]["write"]="false"
+  with self.assertRaises(PolicyError):resolve_policy("ops",config)
+ def test_bridge_source_reference_is_config_only(self):
+  from unittest.mock import patch
+  os.environ["JMAP_TOKEN"]="synthetic"
+  os.environ["ICS_SECRET"]="https://safe.example/private?bearer-test"
+  m=load_plugin();config=binding();config["bridge"]={"source_credential_env":"ICS_SECRET","reference_resource":"reference"}
+  config["calendars"]["reference"]={"calendar_id":"r","slug":"ref","read":True,"write":False}
+  with tempfile.TemporaryDirectory() as d:
+   c=Context("ops",config,Path(d));m.register(c)
+   schema=c.tools["stalwart_calendar_subscribe_external"]["schema"]
+   self.assertEqual(schema["parameters"]["properties"],{})
+   with patch.object(m.StalwartAdapter,"register_bridge",return_value={"bridge_id":"opaque","registered":True}):
+    result=json.loads(c.tools["stalwart_calendar_subscribe_external"]["handler"]({}))
+   self.assertTrue(result["ok"])
+   self.assertNotIn("bearer-test",json.dumps(result)+json.dumps(c.state.saved))
  def test_missing_credential_hides_tools(self):
   os.environ.pop("JMAP_TOKEN",None);m=load_plugin()
   with tempfile.TemporaryDirectory() as d:

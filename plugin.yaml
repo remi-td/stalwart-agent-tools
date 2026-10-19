@@ -14,5 +14,6 @@ provides_tools:
   - stalwart_calendar_upsert
   - stalwart_calendar_delete
   - stalwart_calendar_subscribe_external
+  - stalwart_calendar_refresh_external
 config_schema:
   binding: {type: dict, required: true}
